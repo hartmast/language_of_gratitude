@@ -1,0 +1,857 @@
+---
+title: "The language of gratitude"
+author: "Stefan Hartmann, Nils Hansson & Adrian Loerbroks"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float: true
+    collapsed: false
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+
+```{r, message = FALSE}
+
+library(tidyverse)
+library(ggbeeswarm)
+library(patchwork)
+library(readxl)
+library(patchwork)
+library(stringr)
+library(stringi)
+library(tidytext)
+library(ngram)
+library(quanteda)
+library(vroom)
+library(pbapply)
+library(cluster)
+library(wordcloud)
+library(wordcloud2)
+library(data.table)
+library(DT)
+library(collostructions) # available at sfla.ch
+
+```
+
+read data (tagged with [Spacy](https://spacy.io))
+Tagged datasets [here](https://uni-duesseldorf.sciebo.de/s/oHc608YWQcG45Tf)
+
+```{r, message = FALSE}
+# read data ---------------------------------------------------------------
+# f <- list.files("danksagungen_tagged_NER/", pattern = "csv", full.names = T)
+# d <- do.call(rbind, lapply(1:length(f), function(i) mutate(read_csv(f[i]), doc = i)))
+
+d <- read_csv("danksagungen_tagged_NER.csv")
+bawl <- read_xlsx("BAWL-R .xlsx")
+
+
+```
+
+## Summary statistics
+
+Manual inspection of the data has shown that documents with less than 26 words are artifacts (incomplete documents or statements that the acknowledgments are not included in the online version).
+
+```{r}
+
+d %>% group_by(file) %>% summarise(
+  n = n()
+) %>% filter(n>26) %>% summarise(
+  sum = n(),
+  min = min(n),
+  max = max(n),
+  mean = mean(n),
+  median = median(n),
+  sd = sd(n)
+)
+
+
+
+```
+
+Data wrangling
+
+```{r}
+
+# filter all with < 26
+exclude_these <- d %>% group_by(file) %>% summarise(
+  n = n()
+) %>% filter(n<26) %>% select(file) %>% as.vector() %>% unname() %>% unlist()
+
+
+# exclude
+d <- d %>% filter(!file %in% exclude_these)
+
+# check which person names belong together
+d$rep <- NA
+
+for(i in 2:nrow(d)) {
+  if(!is.na(d$entities[i])) {
+    if(d$entities[i] == "PER" &  d$entities[i-1] == "PER" & 
+       d$file[i] == d$file[i-1] &
+       d$enttype[i] == d$enttype[i-1]) {
+      d$rep[i] <- "y"
+    }
+  }
+
+  # print(i)
+}
+
+# number of words per document
+n_per_doc <- d %>% group_by(file) %>% summarise(
+  n = n()
+)
+
+
+# number of names per document
+n_names <- d %>% group_by(file) %>% filter(entities=="PER" & is.na(rep)) %>%
+  summarise(
+    n_names = n()
+  )
+
+# join
+n_per_doc <- left_join(n_per_doc, n_names)
+
+
+# remove unrealistic outliers
+# n_per_doc <- filter(n_per_doc, n>20)
+
+# relative frequency of names
+n_per_doc$names_rel <- n_per_doc$n_names / n_per_doc$n
+
+```
+
+## Length of each document
+
+```{r}
+# plot length
+p1 <- ggplot(mutate(n_per_doc, group = 1), aes(x=group, y = n)) +
+  geom_beeswarm(col="lightblue") + geom_boxplot(alpha = .5) +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  ylab("Length (in words)") + xlab("") +
+  ggtitle("Length") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+# plot number of names
+p2 <- ggplot(mutate(n_per_doc, group = 1), aes(x=group, y = n_names)) +
+  geom_beeswarm(col="deeppink3", alpha = .3) + geom_boxplot(alpha = .5) +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  ylab("# of named entities") + xlab("") +
+  ggtitle("# of names") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p1 + p2
+# ggsave("length.png", width = 10, height = 4.5)
+
+```
+
+mean and sd:
+
+```{r}
+
+n_per_doc$n %>% mean
+n_per_doc$n %>% sd
+
+```
+
+
+## Parts of speech
+```{r}
+
+# plot POS
+d$POS <- case_when(d$pos %in% c("ADP", "ADV", "CCONJ", "DET", "NUM",
+                       "PART", "PRON", "PUNCT", "SCONJ", 
+                       "SPACE", "X") ~"other",
+          d$pos %in% c("AUX", "VERB") ~ "verb",
+          d$pos == "ADJ" ~ "adjective",
+          d$pos == "NOUN" ~ "noun",
+          d$pos == "PROPN" ~ "proper name")
+
+d$POS <- factor(d$POS, levels = c("other", "verb", "adjective", "noun", "proper name"))
+
+ggplot(d, aes(x = fct_infreq(factor(file)), 
+              fill = POS)) + geom_bar(position = "fill") +
+  scale_fill_viridis_d() +
+  guides(fill=guide_legend(ncol=1)) +
+  xlab("Document") + ylab("n")
+
+```
+
+## Collexeme analysis: early vs. late words
+
+Our qualitative analysis of a subsample has shown that there is a clear divide between early and late words in the acknowledgment sections. As such, we can assume that some words will be more likely to occur in early and other in later parts of an acknowlegdment. 
+
+```{r}
+
+# add absolute and relative position
+d$abs_position <- unlist(lapply(1:length(rle(d$file)$lengths), function(i) 1:(rle(d$file)$lengths[i])))
+
+# file length
+d_file_lengths <- d %>% group_by(file) %>% summarise(
+  length_file = n()
+)
+
+# join
+d <- left_join(d, d_file_lengths)
+
+# relative position
+d$rel_position <- d$abs_position / d$length_file
+
+# se function
+se <- function(x) sqrt(var(x) / length(x))
+
+# get and plot mean and absolute relative position
+for(i in c(1:3)) {
+  assign(paste0("p", i), d %>% filter(POS %in% c("noun", "adjective", "verb")) %>% group_by(lemma, POS) %>% summarise(
+  n = n(),
+  mean = mean(na.omit(rel_position)),
+  sd = sd(na.omit(rel_position)),
+  se = se(na.omit(rel_position)),
+  min = mean-se,
+  max = mean+se
+) %>% mutate(LEMMA = toupper(lemma)) %>%
+  left_join(., bawl, by = c("LEMMA" = "WORD")) %>%
+  filter(n>20) %>%
+  mutate("Emotional Valence" = EMO_MEAN) %>%
+  filter(POS == c("verb", "adjective", "noun")[i]) %>%
+  arrange(mean) %>% 
+  ggplot(aes(y = fct_reorder(lemma, mean, .desc = T), x = mean, col = `Emotional Valence`)) +
+  geom_point() + 
+  geom_errorbar(aes(xmin=min, xmax=max)) +
+  facet_wrap(~POS, scales = "free_x") +
+  xlab("Mean position") + ylab("Lemma") +
+  # guides(col = guide_legend(title = "emotional valence")) +
+  # ggtitle("Relative position of word in the text") +
+  scale_color_gradient2(limits = c(-3,3), low = "darkblue", mid = "white", high = "darkred")) 
+}
+
+p3 + p1 /
+  p2 + plot_layout(guides = "collect") +
+  plot_annotation("Relative position of word in the text")
+# ggsave("position_word.png", width = 13, height = 12)
+
+d %>% filter(POS %in% c("noun", "adjective", "verb")) %>% group_by(lemma, POS) %>% summarise(
+  n = n(),
+  mean = mean(na.omit(rel_position)),
+  sd = sd(na.omit(rel_position)),
+  se = se(na.omit(rel_position)),
+  min = mean-se,
+  max = mean+se
+) %>% mutate(LEMMA = toupper(lemma)) %>%
+  left_join(., bawl, by = c("LEMMA" = "WORD")) %>%
+  filter(n>20) %>%
+  filter(POS == c("verb", "adjective", "noun")[1]) %>%
+  arrange(mean) %>% 
+  ggplot(aes(y = fct_reorder(lemma, mean, .desc = T), x = mean, col = EMO_MEAN)) +
+  geom_point() + 
+  geom_errorbar(aes(xmin=min, xmax=max)) +
+  facet_wrap(~POS, scales = "free") +
+  xlab("Mean position") + ylab("Lemma") +
+  ggtitle("Relative position of word in the text") +
+  scale_color_gradient2(limits = c(-3,3), low = "darkblue", mid = "white", high = "darkred") 
+  
+
+# absolute emotional valence and its distribution
+emo_tbl <- d %>% filter(POS %in% c("noun", "adjective", "verb")) %>% mutate(LEMMA = toupper(lemma)) %>%
+  left_join(., bawl, by = c("LEMMA" = "WORD")) %>% select(LEMMA, POS, EMO_MEAN, rel_position) %>% na.omit %>%
+  mutate(emo_abs = abs(EMO_MEAN))
+
+ggplot(emo_tbl, aes(x = rel_position, y = emo_abs)) + geom_smooth()
+
+cor.test(emo_tbl$rel_position, emo_tbl$EMO_MEAN, method = "kendall")
+
+
+```
+
+Frequency of the word "danken" in each acknowledgment
+
+```{r}
+
+d %>% mutate(dank = grepl("[Dd]ank.*", .$lemma)) %>%
+  group_by(file) %>% summarise(
+  n_dank = length(which(dank==TRUE)),
+  n = n(),
+  rel = n_dank / n
+) %>% arrange(rel) %>% print(n = 20)
+
+```
+
+## Pattern analysis
+
+The TIGER corpus is used as a baseline to check which n-grams occur with above-chance frequency in the acknowledgments data.
+
+```{r}
+
+# TIGER
+tiger <- vroom("../../Corpora/TIGER/tiger_release_aug07.corrected.16012013.conll09",
+               delim = "\t", col_names = c("no", "word", "lemma", "a", "POS", "b", "morph", "c","d","e","f","g", "h", "i"))
+
+# add lemma column distinguishing between . and other punctuation marks
+tiger$Lemma <- ifelse(tiger$word=="." & tiger$lemma=="--", ".", tiger$lemma)
+
+
+
+# sentence by sentence:
+
+# full stops as "breaking points"
+fullstop <- which(tiger$Lemma==".")
+fullstop[1] <- 1
+fullstop[length(fullstop)+1] <- nrow(tiger)
+
+
+# word form, lemma and POS lists as word vectors
+tiger00a <- pblapply(1:(length(fullstop)-1), function(i) paste0(tiger$word[fullstop[i]:fullstop[i+1]]))
+tiger01a <- pblapply(1:(length(fullstop)-1), function(i) paste0(tiger$Lemma[fullstop[i]:fullstop[i+1]]))
+tiger02a <- pblapply(1:(length(fullstop)-1), function(i) paste0(tiger$POS[fullstop[i]:fullstop[i+1]]))
+
+# find and remove punctuation
+find_punctuation <- pblapply(1:length(tiger01a), function(i) grep("^[[:punct:]]+$", tiger00a[[i]]))
+
+for(i in 1:length(tiger00a)) {
+  if(length(find_punctuation[[i]]) > 0) {
+    tiger00a[[i]] <- tiger00a[[i]][-find_punctuation[[i]]]
+    tiger01a[[i]] <- tiger01a[[i]][-find_punctuation[[i]]]
+    tiger02a[[i]] <- tiger02a[[i]][-find_punctuation[[i]]]
+  }
+}
+
+
+# word form, lemma and POS lists as full sentences
+tiger00 <- lapply(1:length(tiger00a), function(i) paste0(tiger00a[[i]], collapse = " "))
+tiger01 <- lapply(1:length(tiger01a), function(i) paste0(tiger01a[[i]], collapse = " "))
+tiger02 <- lapply(1:length(tiger02a), function(i) paste0(tiger02a[[i]], collapse = " "))
+
+# lemma n-grams
+# tigern <- tokens_ngrams(tokens(unlist(tiger01)), n = 2:6, concatenator = " ")
+# as.character(tigern) %>% writeLines("tiger_lemma_ngrams.txt")
+
+# pos ngrams
+# tigern <- tokens_ngrams(tokens(unlist(tiger02)), n = 2:6, concatenator = " ")
+# as.character(tigern) %>% writeLines("tiger_pos_ngrams.txt")
+
+# word form ngrams
+# tigern <- tokens_ngrams(tokens(unlist(tiger00)), n = 2:6, concatenator = " ")
+# as.character(tigern) %>% writeLines("tiger_word_form_ngrams.txt")
+
+
+# skipgrams
+# tigern2 <- tokens_ngrams(tokens(tiger01), n = 2:6, skip = 1:3, concatenator = " ")
+
+
+# tiger -------------------------------------------------------------------
+
+tiger <- readLines("tiger_lemma_ngrams.txt")
+tiger_tbl <- as_tibble(table(tiger)) %>% arrange(desc(n))
+tiger_tbl <- tiger_tbl %>% setNames(c("trigrams", "n_all"))
+
+# ngrams ------------------------------------------------------------------
+
+# add lemma column distinguishing between . and other punctuation marks
+d$Lemma <- ifelse(d$tok=="." & d$lemma=="--", ".", d$lemma)
+
+# sentence by sentence:
+
+# full stops as "breaking points"
+fullstop <- which(d$Lemma==".")
+fullstop[1] <- 1
+fullstop[length(fullstop)+1] <- nrow(d)
+
+
+# word form, lemma and POS lists as word vectors
+d00a <- pblapply(1:(length(fullstop)-1), function(i) paste0(d$tok[fullstop[i]:fullstop[i+1]]))
+d01a <- pblapply(1:(length(fullstop)-1), function(i) paste0(d$Lemma[fullstop[i]:fullstop[i+1]]))
+d02a <- pblapply(1:(length(fullstop)-1), function(i) paste0(d$pos[fullstop[i]:fullstop[i+1]]))
+
+# check that all have the same length
+for(i in 1:length(d00a)) {
+  if(!(length(d00a[[i]]) == length(d01a[[i]]) &
+       length(d00a[[i]]) == length(d02a[[i]]))) {
+    print(i)
+  }
+}
+
+# find and remove punctuation
+find_punctuation <- pblapply(1:length(d01a), function(i) grep("^[[:punct:]]+$", d01a[[i]]))
+
+for(i in 1:length(d00a)) {
+  if(length(find_punctuation[[i]]) > 0) {
+    d00a[[i]] <- d00a[[i]][-find_punctuation[[i]]]
+    d01a[[i]] <- d01a[[i]][-find_punctuation[[i]]]
+    d02a[[i]] <- d02a[[i]][-find_punctuation[[i]]]
+  }
+}
+
+
+# check that all have the same length
+for(i in 1:length(d00a)) {
+  if(!(length(d00a[[i]]) == length(d01a[[i]]) &
+       length(d00a[[i]]) == length(d02a[[i]]))) {
+    print(i)
+  }
+}
+
+# word form, lemma and POS lists as full sentences
+d00 <- lapply(1:length(d00a), function(i) paste0(d00a[[i]], collapse = " "))
+d01 <- lapply(1:length(d01a), function(i) paste0(d01a[[i]], collapse = " "))
+d02 <- lapply(1:length(d02a), function(i) paste0(d02a[[i]], collapse = " "))
+
+# check that all have the same langth
+for(i in 1:length(d00)) {
+  if(!(wordcount(d00[[i]]) == wordcount(d01[[i]]) &
+       wordcount(d00[[i]]) == wordcount(d02[[i]]))) {
+    print(i)
+  }
+}
+
+
+# remove punctuation everywhere
+for(i in 1:length(d00)) {
+  d00[[i]] <- gsub("[[:punct:]]", "", d00[[i]])
+  d01[[i]] <- gsub("[[:punct:]]", "", d01[[i]])
+  d02[[i]] <- gsub("[[:punct:]]", "", d02[[i]])
+}
+
+
+# tokenize
+
+d00_t <- tokens(unlist(d00), remove_punct = T)
+d01_t <- tokens(unlist(d01), remove_punct = T)
+d02_t <- tokens(unlist(d02), remove_punct = T)
+
+# check if all have the same length
+for(i in 1:length(d00_t)) {
+  if(!(length(d00_t[[i]]) == length(d01_t[[i]]) &
+       length(d00_t[[i]]) == length(d02_t[[i]]))) {
+    print(i)
+  }
+}
+
+# remove the three that do not work for some reason
+rmv_these <- c(1427, 1429, 1435)
+d00_t <- d00_t[-rmv_these]
+d01_t <- d01_t[-rmv_these]
+d02_t <- d02_t[-rmv_these]
+
+# ngrams:
+
+# lemma ngrams
+d3 <- tokens_ngrams(d01_t, n = 2:6, concatenator = " ")
+d3 <- as.character(d3)
+
+# lowercase:
+d3 <- tolower(d3)
+
+# word form ngrams
+d3_wf <- tokens_ngrams(d01_t, n = 2:6, concatenator = " ")
+d3_wf <- as.character(d3_wf)
+
+# pos ngrams
+d3_pos <- tokens_ngrams(d02_t, n = 2:6, concatenator = " ")
+d3_pos <- as.character(d3_pos)
+
+
+# lemma n-gram table
+d_tbl <- as_tibble(table(d3)) %>% setNames(c("trigrams", "n"))
+d_tbl <- d_tbl %>% arrange(desc(n))
+
+# join tables
+
+# make tiger ngrams lowercase
+tiger_tbl$trigrams <- tolower(tiger_tbl$trigrams)
+tiger_tbl <- tiger_tbl %>% group_by(trigrams) %>% summarise(
+  n_all = sum(n_all)
+) %>% arrange(desc(n_all))
+
+d_tbl <- left_join(d_tbl, tiger_tbl)
+d_tbl <- d_tbl %>% replace_na(list(n = 0, n_all = 0))
+
+# convert all to lowercase
+# d_tbl_backup <- d_tbl
+# d_tbl$trigrams <- tolower(d_tbl$trigrams)
+# d_tbl <- d_tbl %>% group_by(trigrams) %>% summarise(
+#   n = sum(n),
+#   n_all = sum(n_all)
+# )
+
+# get collexemes
+d_collex <- d_tbl %>% as.data.frame %>% collex.dist()
+
+# results without punctuation
+d_collex[grep("[[:punct:]]", d_collex$COLLEX, invert = T),] # %>% writexl::write_xlsx("dank_collex.xlsx")
+
+# add wordcount
+d_collex$wordcount <- sapply(1:nrow(d_collex), function(i) wordcount(d_collex$COLLEX[i]))
+
+# without punctuation & 3+ words
+d_collex[grep("[[:punct:]]", d_collex$COLLEX, invert = T),] %>%
+  filter(wordcount>3) # %>% writexl::write_xlsx("dank_collex.xlsx")
+
+
+# similarity --------------------------------------------------------------
+
+# limit to the most frequent n-grams
+# --> to find them, first create a dataframe of
+# word, lemma, pos ngrams
+
+df <- tibble(word = d3_wf, lemma = d3, pos = d3_pos)
+df <- df %>% group_by(lemma) %>% add_tally()
+df1 <- filter(df, n >= 10) # only keep n-grams attested
+                                        # 10 or more times
+
+# add column with lowercase lemma
+df1$Lemma <- df1$lemma
+df1$lemma <- tolower(df1$lemma)
+
+# create list with individual words/lemmas/pos
+# for each ngram
+df1 %>% arrange(desc(n))
+
+df2 <- df1 %>% group_by(word, pos, lemma) %>% summarise(
+  n = sum(unique(n))
+) %>% arrange(desc(n))
+
+# df2 <- df1 %>% arrange(desc(lemma))
+df2 <- df2[-which(duplicated(df2$lemma)),]
+
+# huge matrix with unique lemmas, word forms, and POS tags as
+# colnames and n-grams as rownames
+
+# rwnms <- c(levels(factor(unlist(strsplit(df2$word, " ")))), 
+#   levels(factor(unlist(strsplit(df2$lemma, " ")))),
+#   levels(factor(unlist(strsplit(df2$pos, " ")))))
+
+# update: only lemmas yields better results (for obvious reasons,
+# as here we are only interested in similarities pertaining to
+# the involved lemmas, not su much syntactic patterns etc.)
+
+# row names for the matrix
+rwnms <- levels(factor(unlist(strsplit(df2$lemma, " "))))
+
+
+
+
+
+# create empty matrix
+m <- matrix(ncol = length(rwnms), nrow = nrow(df2))
+
+
+
+# fill matrix
+for(i in 1:nrow(m)) {
+  m[i,] <- as.numeric(rwnms %in% unlist(strsplit(df2$lemma[i], " ")))
+  # m[i,] <- as.numeric(rwnms %in% c(unlist(strsplit(df2$lemma[i], " ")),
+  #                                  unlist(strsplit(df2$word[i], " ")),
+  #                                  unlist(strsplit(df2$pos[i], " "))))
+}
+
+
+# add colnames and rownames
+colnames(m) <- rwnms
+rownames(m) <- df2$lemma
+
+
+
+
+# get Euclidean distance between n-grams
+m_dist <- dist(m)
+
+# square Euclidean distance
+m_dist2 <- m_dist^2
+m_dist_matrix <- as.matrix(m_dist2)
+
+
+# get tibble that allows for sorting
+# the n-grams according to their
+# similarity: similarity score in
+# one column, n-gram 1 in another,
+# n-gram2 in the third
+
+m_dist_df <- as.data.frame(m_dist_matrix) %>% 
+  rownames_to_column() %>% 
+  as_tibble()
+m_dist_df <- m_dist_df %>% pivot_longer(cols = 2:length(m_dist_df))
+colnames(m_dist_df) <- c("ngram1", "ngram2", "dist")
+m_dist_df1 <- m_dist_df %>% 
+  filter(dist > 0) %>% 
+  arrange(dist)
+
+# add frequency of each n-gram
+ngram_freqs <- select(ungroup(df2), lemma, n)
+
+# m_dist_df als data table
+m_dist_df1a <- as.data.table(m_dist_df1)
+ngram_freqs1 <- as.data.table(ngram_freqs)
+
+m_distdf1b <- merge(m_dist_df1a, ngram_freqs1, by.x = "ngram1",
+                  by.y = "lemma")
+
+m_distdf1c <- merge(m_distdf1b, ngram_freqs1, by.x = "ngram2",
+                    by.y = "lemma")
+
+
+# add wordcount
+m_distdf1c[, wordcountx := pbsapply(1:nrow(m_distdf1c), function(i) wordcount(m_distdf1c$ngram1[i]))]
+m_distdf1c[, wordcounty := pbsapply(1:nrow(m_distdf1c), function(i) wordcount(m_distdf1c$ngram2[i]))]
+
+# add "normalized" frequency by dividing by wordcount
+m_distdf1c[, norm_freq1 := n.x / wordcountx]
+m_distdf1c[, norm_freq2 := n.y / wordcounty]
+
+
+
+# if dist <= 2, only keep the item
+# with the higher normalized frequency
+
+m_distdf1c[dist <= 2 & norm_freq1 < norm_freq2, rmv := "x"]
+m_distdf1c[dist <= 2 & norm_freq1 > norm_freq2, rmv := "y"]
+
+
+# list of items to be removed
+rmv <- unique(c(m_distdf1c[rmv=="x"]$ngram2, m_distdf1c[rmv=="y"]$ngram1))
+
+# ngram list with items to be omitted
+df1a <- df1[-which(df1$lemma %in% rmv),]
+
+# same for collexeme table
+d_collex1 <- d_collex %>% filter(!COLLEX %in% rmv & O.CXN1 > 0)
+d_collex1a <- d_collex1[grep("(?<= )[[:punct:]]", d_collex1$COLLEX, invert = T, perl = T),] %>%
+  filter(SIGNIF!="ns")
+d_collex1a$LOGFREQ <- log(d_collex1a$O.CXN1)
+d_collex1aa <- filter(d_collex1a, ASSOC != "n_all")
+
+# omit all items containing numbers or NA
+d_collex1a <- d_collex1a[!grepl("[0-9]|na ", d_collex1a$COLLEX),]
+d_collex1aa <- d_collex1aa[!grepl("[0-9]|na ", d_collex1aa$COLLEX),]
+
+# table
+d_collex1aa %>% datatable(escape = FALSE, filter = list(position = "top"))
+
+# make wordcloud
+set.seed(1985)
+wordcloud2(select(d_collex1a, COLLEX, O.CXN1), fontFamily = "Arial",
+           fontWeight = "normal", 
+           minRotation = 0, maxRotation = 0)
+
+
+# only with attracted collexemes
+# png("wordcloud01_col.png", width = 6, height = 6, un = "in", res = 400)
+set.seed(1985)
+wordcloud(words = filter(d_collex1aa, O.CXN1 < 1000)$COLLEX,
+          freq = filter(d_collex1aa, O.CXN1 < 1000)$O.CXN1,
+          colors = terrain.colors(7),
+          scale = c(2,.2), min.freq = 15)
+# dev.off()
+
+# wordcloud based on collostruction strength
+ png("wordcloud_collex_color.png", width = 6, height = 6, un = "in", res = 900)
+# svg("wordcloud_collex.svg", width = 3, height = 3) - not working, use export function in RStudio
+set.seed(1985)
+wordcloud(words = d_collex1aa$COLLEX,
+          freq = d_collex1aa$COLL.STR.LOGL,
+          colors = terrain.colors(7),
+          scale = c(1.5,.05), min.freq = 7)
+ dev.off()
+
+
+
+
+
+
+```
+
+
+
+## Qualitative analysis
+
+```{r}
+
+d <- read_xlsx("Qualitative_Analyse/CodierteSegmente.xlsx")
+
+# add index number
+d$no <- 1:nrow(d)
+
+# identify duplicates
+d <- left_join(d,tibble(Segment = unique(d$Segment),
+                    No = 1:length(unique(d$Segment))))
+
+duplicate_numbers <- d[which(duplicated(d$No)),]$no
+
+# read tagged data --------------------------------------------------------
+d1 <- read_csv("Qualitative_Analyse/codierte_segmente_tagged.csv")
+
+# add index number to join dataframes
+d1$no <- as.numeric(gsub("[^0-9]", "", d1$file))-1
+
+
+# get codes ---------------------------------------------------------------
+
+d <- separate_wider_delim(d, cols = Code, delim = ">", 
+                     names_sep = "_", too_few = "align_start")
+
+# join dataframes
+d1 <- left_join(d1, 
+          select(d, c("no", starts_with("Code"))))
+
+
+# distinctive collexeme analysis:
+# privat (private) vs. beruflich (professional)
+
+filter(d1, pos %in% c("NOUN", "ADJ", "VERB") & !no %in% duplicate_numbers) %>% 
+  select(Code_2, lemma) %>%
+  as.data.frame() %>%
+  collex.dist(raw = T, reverse = F)#%>% writexl::write_xlsx("collex_danksagungen_beruflich_privat.xlsx")
+
+# attracted to "beruflich"
+filter(d1, pos %in% c("NOUN", "ADJ", "VERB") & !no %in% duplicate_numbers) %>% 
+  select(Code_2, lemma) %>%
+  as.data.frame() %>%
+  collex.dist(raw = T, reverse = F) %>% 
+  filter(O.CXN1 >2 &  ASSOC==" Beruflich ") %>%
+  select(COLLEX, O.CXN1, COLL.STR.LOGL, SHARED) %>% datatable() #%>%
+   #writexl::write_xlsx("collex_beruflich.xlsx")
+
+# attracted to "privat"
+filter(d1, pos %in% c("NOUN", "ADJ", "VERB") & !no %in% duplicate_numbers) %>% 
+  select(Code_2, lemma) %>%
+  as.data.frame() %>%
+  collex.dist(raw = T, reverse = T) %>% 
+  filter(O.CXN2 >2 & ASSOC==" Privat ") %>%
+  select(COLLEX, O.CXN2, COLL.STR.LOGL, SHARED) %>% datatable() #%>%
+ # writexl::write_xlsx("collex_privat.xlsx")
+
+```
+
+
+Position in text
+
+```{r}
+
+# raw texts
+f <- list.files("danksagungen_sample/", full.names = TRUE)
+d2 <- do.call(rbind, lapply(1:length(f), function(i) mutate(tibble(text = read_lines(f[i])), file = gsub(".*/", "", f[i]))))
+d2$Dokumentname <- gsub("\\.txt", "", d2$file)
+d2$Dokumentname <- as.numeric(d2$Dokumentname)
+
+# add full texts to segments
+d <- left_join(d, select(d2, Dokumentname, text))
+
+# start and end position
+d$start <- sapply(1:nrow(d), function(i) unlist(str_locate_all(d$text[i], fixed(d$Segment[i])))[1])
+d$end <- sapply(1:nrow(d), function(i) unlist(str_locate_all(d$text[i], fixed(d$Segment[i])))[2])
+
+# number of characters
+d$nchar <- sapply(1:nrow(d), function(i) nchar(d$text[i]))
+
+# normalized start and end position
+d$start_norm <- d$start / d$nchar
+d$end_norm   <- d$end / d$nchar
+
+# plot
+
+d$Domain <- ifelse(grepl("Beruflich", d$Code_2), "professional", "private")
+
+(p1 <- ggplot(filter(d, !no %in% duplicate_numbers), aes(x = Domain, y = start_norm, fill = Domain)) +
+  geom_beeswarm(col="blue", size = .5) +
+  geom_violin(alpha = .2) + 
+  guides(fill = guide_legend(title = "Domain")) +
+  xlab("Domain") + ylab("Start of segment (normalized)") +
+  guides(fill = "none") + scale_fill_manual(values = c("orange", "blue")) + coord_flip())
+#  ggsave("beruflich_privat.png")
+
+```
+
+Visualization with tiles
+
+```{r}
+
+# get positions
+for(j in 1:length(levels(factor(d$Dokumentname)))) {
+  # current document
+  d_cur <- filter(d, Dokumentname==levels(factor(d$Dokumentname))[j])
+  
+  # current vector - default color: grey
+  cur <- rep("grey", 100)
+  
+  # change color for the coded segments
+  cur_list <- lapply(1:length(round(d_cur$start_norm*100)),
+                     function(i) round(d_cur$start_norm*100)[i]:round(d_cur$end_norm*100)[i])
+  
+  for(i in 1:length(cur_list)) {
+    if(d_cur$Code_2[i]==" Privat ") {
+      cur[cur_list[[i]]] <- "orange"
+    } else {
+      cur[cur_list[[i]]] <- "blue"
+    }
+    
+    # print(i)
+    
+  }
+  
+  # as table with position and color
+  cur_tbl <- tibble(position = 1:100, col = cur, doc = j)
+  
+  # combine with others
+  if(j == 1) {
+    all_tbl <- cur_tbl
+  } else {
+    all_tbl <- rbind(all_tbl, cur_tbl)
+  }
+  
+}
+
+
+
+# helper function from https://dominicroye.github.io/en/2018/how-to-create-warming-stripes-in-r/
+theme_strip <- theme_minimal()+
+  theme(axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.title = element_blank(),
+        panel.grid.major = element_blank(),
+        # legend.title = element_blank(),
+        axis.text.x = element_text(vjust = 3),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 14, face = "bold")
+  )
+
+
+# visualize
+all_tbl$col <- factor(all_tbl$col, levels = c("blue", "orange", "grey"))
+all_tbl
+
+(p2 <- ggplot(all_tbl, aes(x = position, y = 1, fill = col)) +
+  geom_tile() +
+    theme(axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.line.x = element_blank(),
+        #axis.title = element_blank(),
+        panel.grid.major = element_blank(),
+        # legend.title = element_blank(),
+        #axis.text.x = element_text(vjust = 3),
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 14, face = "bold")
+  ) +
+  facet_wrap(doc ~ .,ncol=1, strip.position  = "left") +
+  scale_fill_identity(guide = 'legend',
+                      labels = c("professional", "private", "not coded")) +
+  guides(fill = guide_legend(title = "Domain")) +
+  theme(strip.text.y.left = element_text(angle = 0)) +
+  #theme(axis.text.x = element_blank()) + 
+    xlab("Position") + ylab("Document") +
+    scale_x_continuous(breaks = NULL))
+# ggsave("beruflich_privat_tiles.png", width = 6.5, height = 5, bg="white")
+
+# p2 + p1
+# ggsave("domains.png", width = 13, height = 6)
+
+```
+
+
